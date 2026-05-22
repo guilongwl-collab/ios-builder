@@ -153,347 +153,43 @@ jobs:
             done < /tmp/icon_sizes.txt
           fi
 
-      - name: Patch WKWebView shell
+      - name: Patch uploaded app metadata placeholders
         run: |
           set -e
-          VC=$(find source -name "ViewController.swift" | head -1)
-          if [ -n "$VC" ]; then
-            cat > "$VC" <<'SWIFT'
-          import UIKit
-          import WebKit
-
-          final class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
-              private let defaultHomeURLString = "__WEB_URL__"
-              private var webView: WKWebView!
-              private let progressView = UIProgressView(progressViewStyle: .default)
-              private let refreshControl = UIRefreshControl()
-              private let lastURLKey = "IOSWebViewLastVisitedURL"
-              private let cookieArchiveKey = "IOSWebViewPersistedHTTPCookies"
-              private var downloadAlert: UIAlertController?
-
-              private static let fixedTopbarScript = """
-              (function(){
-                function installStyle(){
-                  try {
-                    var id='ios-webview-fixed-topbar-style';
-                    var old=document.getElementById(id);
-                    if(old&&old.parentNode) old.parentNode.removeChild(old);
-                    var css=`@media (max-width: 900px){
-                      html,body{min-height:100%!important;-webkit-overflow-scrolling:touch!important;overscroll-behavior-y:auto!important;background:#f4f7fb!important;}
-                      body.ios-native-webview .topbar, body.ios-native-webview header.topbar{
-                        position:fixed!important;top:0!important;left:0!important;right:0!important;width:100%!important;
-                        z-index:2147483000!important;transform:translateZ(0)!important;-webkit-transform:translateZ(0)!important;
-                        background:rgba(255,255,255,.98)!important;-webkit-backdrop-filter:blur(12px)!important;backdrop-filter:blur(12px)!important;
-                      }
-                      body.ios-native-webview .main{padding-top:calc(100px + env(safe-area-inset-top,0px))!important;}
-                      body.login-body.ios-native-webview.ios-login-page{padding-top:calc(72px + env(safe-area-inset-top,0px))!important;padding-bottom:calc(28px + env(safe-area-inset-bottom,0px))!important;align-items:flex-start!important;}
-                      body.ios-native-webview.ios-login-page .login-card{margin-top:0!important;}
-                      body.ios-native-webview .top-user, body.ios-native-webview .top-user-dropdown{z-index:2147483200!important;}
-                    }`;
-                    var style=document.createElement('style');style.id=id;style.appendChild(document.createTextNode(css));
-                    (document.head||document.documentElement).appendChild(style);
-                    if(document.body) {
-                      document.body.classList.add('ios-native-webview');
-                      if(document.body.classList.contains('login-body') || document.querySelector('.login-card')) document.body.classList.add('ios-login-page');
-                    }
-                  } catch(e) {}
-                }
-                if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',installStyle);}else{installStyle();}
-                setTimeout(installStyle,300);setTimeout(installStyle,1000);setTimeout(installStyle,2200);
-              })();
-              """
-
-              override func loadView() {
-                  let userContentController = WKUserContentController()
-                  userContentController.addUserScript(WKUserScript(source: Self.fixedTopbarScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
-                  let configuration = WKWebViewConfiguration()
-                  configuration.websiteDataStore = WKWebsiteDataStore.default()
-                  configuration.userContentController = userContentController
-                  configuration.allowsInlineMediaPlayback = true
-                  configuration.mediaTypesRequiringUserActionForPlayback = []
-                  webView = WKWebView(frame: .zero, configuration: configuration)
-                  webView.navigationDelegate = self
-                  webView.uiDelegate = self
-                  webView.allowsBackForwardNavigationGestures = true
-                  webView.isOpaque = false
-                  webView.backgroundColor = UIColor(red: 0.96, green: 0.97, blue: 0.99, alpha: 1.0)
-                  webView.scrollView.backgroundColor = webView.backgroundColor
-                  webView.scrollView.contentInsetAdjustmentBehavior = .never
-                  webView.scrollView.bounces = true
-                  webView.scrollView.alwaysBounceVertical = true
-                  webView.scrollView.keyboardDismissMode = .interactive
-                  view = webView
-                  view.backgroundColor = webView.backgroundColor
-              }
-
-              override func viewDidLoad() {
-                  super.viewDidLoad()
-                  setupProgressView()
-                  setupRefreshControl()
-                  installLifecycleObservers()
-                  restoreCookiesThenLoad()
-              }
-
-              override func viewDidLayoutSubviews() {
-                  super.viewDidLayoutSubviews()
-                  webView.scrollView.verticalScrollIndicatorInsets.top = view.safeAreaInsets.top
-                  webView.scrollView.verticalScrollIndicatorInsets.bottom = view.safeAreaInsets.bottom
-              }
-
-              deinit {
-                  persistCookiesNow()
-                  NotificationCenter.default.removeObserver(self)
-                  webView.removeObserver(self, forKeyPath: #keyPath(WKWebView.estimatedProgress))
-              }
-
-              private func setupProgressView() {
-                  progressView.translatesAutoresizingMaskIntoConstraints = false
-                  view.addSubview(progressView)
-                  NSLayoutConstraint.activate([
-                      progressView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-                      progressView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-                      progressView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                      progressView.heightAnchor.constraint(equalToConstant: 2)
-                  ])
-                  webView.addObserver(self, forKeyPath: #keyPath(WKWebView.estimatedProgress), options: .new, context: nil)
-              }
-
-              private func setupRefreshControl() {
-                  refreshControl.tintColor = UIColor(red: 0.03, green: 0.74, blue: 0.40, alpha: 1.0)
-                  refreshControl.attributedTitle = NSAttributedString(string: "下拉刷新", attributes: [.foregroundColor: UIColor(red: 0.45, green: 0.52, blue: 0.62, alpha: 1.0)])
-                  refreshControl.addTarget(self, action: #selector(reloadPage), for: .valueChanged)
-                  webView.scrollView.refreshControl = refreshControl
-              }
-
-              private var homeURL: URL { URL(string: defaultHomeURLString) ?? URL(string: "https://kuangjia2.wenanku.cc/")! }
-
-              private func installLifecycleObservers() {
-                  NotificationCenter.default.addObserver(self, selector: #selector(handleAppBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
-                  NotificationCenter.default.addObserver(self, selector: #selector(handleAppBackground), name: UIApplication.willTerminateNotification, object: nil)
-              }
-
-              @objc private func handleAppBackground() { persistCookiesNow() }
-
-              private func restoreCookiesThenLoad() {
-                  guard let data = UserDefaults.standard.data(forKey: cookieArchiveKey),
-                        let cookies = try? NSKeyedUnarchiver.unarchiveTopLevelObjectWithData(data) as? [HTTPCookie],
-                        !cookies.isEmpty else {
-                      loadInitialPage()
-                      return
-                  }
-                  let store = webView.configuration.websiteDataStore.httpCookieStore
-                  let group = DispatchGroup()
-                  for cookie in cookies where shouldStoreCookie(cookie) {
-                      group.enter()
-                      store.setCookie(cookie) { group.leave() }
-                  }
-                  group.notify(queue: .main) { [weak self] in self?.loadInitialPage() }
-              }
-
-              private func persistCookiesNow() {
-                  let store = webView.configuration.websiteDataStore.httpCookieStore
-                  store.getAllCookies { [weak self] cookies in
-                      guard let self = self else { return }
-                      let scoped = cookies.filter { self.shouldStoreCookie($0) }
-                      if let data = try? NSKeyedArchiver.archivedData(withRootObject: scoped, requiringSecureCoding: false) {
-                          UserDefaults.standard.set(data, forKey: self.cookieArchiveKey)
-                          UserDefaults.standard.synchronize()
-                      }
-                  }
-              }
-
-              private func loadInitialPage() {
-                  if let saved = UserDefaults.standard.string(forKey: lastURLKey),
-                     let savedURL = URL(string: saved),
-                     shouldRestore(savedURL),
-                     !isLoginURL(savedURL) {
-                      load(url: savedURL)
-                  } else {
-                      load(url: homeURL)
-                  }
-              }
-
-              private func load(url: URL) { webView.load(URLRequest(url: url)) }
-
-              private func normalizedHost(_ value: String?) -> String {
-                  return (value ?? "").trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
-              }
-
-              private func shouldRestore(_ url: URL) -> Bool {
-                  guard let savedHost = url.host, let homeHost = homeURL.host else { return false }
-                  let a = normalizedHost(savedHost)
-                  let b = normalizedHost(homeHost)
-                  return a == b || a.hasSuffix("." + b) || b.hasSuffix("." + a)
-              }
-
-              private func shouldStoreCookie(_ cookie: HTTPCookie) -> Bool {
-                  let cookieDomain = normalizedHost(cookie.domain)
-                  guard !cookieDomain.isEmpty, let homeHost = homeURL.host else { return false }
-                  let h = normalizedHost(homeHost)
-                  return cookieDomain == h || h.hasSuffix("." + cookieDomain) || cookieDomain.hasSuffix("." + h)
-              }
-
-              private func isLoginURL(_ url: URL) -> Bool {
-                  return url.path.lowercased().contains("login.php")
-              }
-
-              @objc private func reloadPage() {
-                  if webView.url == nil {
-                      loadInitialPage()
-                  } else {
-                      webView.reload()
-                  }
-              }
-
-              private func isDownloadURL(_ url: URL) -> Bool {
-                  let path = url.path.lowercased()
-                  let query = (url.query ?? "").lowercased()
-                  let fileExt = url.pathExtension.lowercased()
-                  let downloadExts: Set<String> = ["ipa", "zip", "mobileconfig", "p12", "cer", "deb", "dylib", "framework"]
-                  if downloadExts.contains(fileExt) { return true }
-                  if query.contains("download=ipa") || query.contains("download=artifact") || query.contains("download=source") || query.contains("download=zip") { return true }
-                  if path.contains("/api/ios_build/package.php") { return true }
-                  return false
-              }
-
-              private func downloadFile(from url: URL) {
-                  showDownloadAlert("正在准备下载…")
-                  let store = webView.configuration.websiteDataStore.httpCookieStore
-                  store.getAllCookies { [weak self] cookies in
-                      guard let self = self else { return }
-                      var request = URLRequest(url: url)
-                      request.httpShouldHandleCookies = true
-                      let cookieHeader = HTTPCookie.requestHeaderFields(with: cookies)
-                      for (key, value) in cookieHeader { request.setValue(value, forHTTPHeaderField: key) }
-                      let task = URLSession.shared.downloadTask(with: request) { [weak self] tempURL, response, error in
-                          guard let self = self else { return }
-                          if let error = error {
-                              DispatchQueue.main.async { self.showDownloadError("下载失败：\(error.localizedDescription)") }
-                              return
-                          }
-                          guard let tempURL = tempURL else {
-                              DispatchQueue.main.async { self.showDownloadError("下载失败：未获取到文件") }
-                              return
-                          }
-                          let fileName = self.filenameForDownload(url: url, response: response)
-                          do {
-                              let dir = FileManager.default.temporaryDirectory.appendingPathComponent("IOSWebViewDownloads", isDirectory: true)
-                              try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                              let dest = dir.appendingPathComponent(fileName)
-                              if FileManager.default.fileExists(atPath: dest.path) { try FileManager.default.removeItem(at: dest) }
-                              try FileManager.default.moveItem(at: tempURL, to: dest)
-                              DispatchQueue.main.async { self.presentDownloadedFile(dest) }
-                          } catch {
-                              DispatchQueue.main.async { self.showDownloadError("保存失败：\(error.localizedDescription)") }
-                          }
-                      }
-                      task.resume()
-                  }
-              }
-
-              private func filenameForDownload(url: URL, response: URLResponse?) -> String {
-                  if let suggested = response?.suggestedFilename, !suggested.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                      return sanitizeFilename(suggested)
-                  }
-                  let query = (url.query ?? "").lowercased()
-                  var name = url.lastPathComponent
-                  if name.isEmpty || !name.contains(".") {
-                      if query.contains("download=ipa") { name = "ios_app.ipa" }
-                      else if query.contains("download=source") || query.contains("download=artifact") || query.contains("download=zip") { name = "ios_build.zip" }
-                      else { name = "download.zip" }
-                  }
-                  return sanitizeFilename(name)
-              }
-
-              private func sanitizeFilename(_ name: String) -> String {
-                  let invalid = CharacterSet(charactersIn: "/\\?%*|\"<>:")
-                  let parts = name.components(separatedBy: invalid).filter { !$0.isEmpty }
-                  let cleaned = parts.joined(separator: "_")
-                  return cleaned.isEmpty ? "download" : cleaned
-              }
-
-              private func showDownloadAlert(_ message: String) {
-                  if let alert = downloadAlert {
-                      alert.message = message
-                      return
-                  }
-                  let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
-                  downloadAlert = alert
-                  present(alert, animated: true)
-              }
-
-              private func dismissDownloadAlert(completion: (() -> Void)? = nil) {
-                  if let alert = downloadAlert {
-                      downloadAlert = nil
-                      alert.dismiss(animated: true, completion: completion)
-                  } else {
-                      completion?()
-                  }
-              }
-
-              private func showDownloadError(_ message: String) {
-                  dismissDownloadAlert { [weak self] in
-                      guard let self = self else { return }
-                      let alert = UIAlertController(title: "下载失败", message: message, preferredStyle: .alert)
-                      alert.addAction(UIAlertAction(title: "确定", style: .default))
-                      self.present(alert, animated: true)
-                  }
-              }
-
-              private func presentDownloadedFile(_ fileURL: URL) {
-                  dismissDownloadAlert { [weak self] in
-                      guard let self = self else { return }
-                      let activity = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
-                      if let popover = activity.popoverPresentationController {
-                          popover.sourceView = self.view
-                          popover.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY, width: 1, height: 1)
-                          popover.permittedArrowDirections = []
-                      }
-                      self.present(activity, animated: true)
-                  }
-              }
-
-              override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
-                  guard keyPath == #keyPath(WKWebView.estimatedProgress) else { return }
-                  progressView.progress = Float(webView.estimatedProgress)
-                  progressView.isHidden = webView.estimatedProgress >= 1.0
-                  if progressView.isHidden { progressView.progress = 0 }
-              }
-
-              func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-                  refreshControl.endRefreshing()
-                  if let url = webView.url, shouldRestore(url), url.scheme?.hasPrefix("http") == true, !isLoginURL(url) {
-                      UserDefaults.standard.set(url.absoluteString, forKey: lastURLKey)
-                  }
-                  persistCookiesNow()
-                  webView.evaluateJavaScript(Self.fixedTopbarScript, completionHandler: nil)
-              }
-
-              func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { refreshControl.endRefreshing() }
-              func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { refreshControl.endRefreshing() }
-
-              func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-                  guard let url = navigationAction.request.url else { decisionHandler(.allow); return }
-                  if isDownloadURL(url) {
-                      downloadFile(from: url)
-                      decisionHandler(.cancel)
-                      return
-                  }
-                  if navigationAction.targetFrame == nil {
-                      webView.load(URLRequest(url: url)); decisionHandler(.cancel); return
-                  }
-                  decisionHandler(.allow)
-              }
+          echo "Keep uploaded Xcode WebView shell source. Only patch placeholders and metadata."
+          python3 - <<'PY'
+          import os, pathlib, sys
+          web = os.environ.get('WEB_URL', '') or 'https://kuangjia2.wenanku.cc/'
+          app = os.environ.get('APP_NAME', '') or ''
+          bundle = os.environ.get('BUNDLE_ID', '') or ''
+          root = pathlib.Path('source')
+          exts = {'.swift', '.plist', '.storyboard', '.xib'}
+          replacements = {
+              '{{WEB_URL}}': web,
+              '__WEB_URL__': web,
+              'https://kuangjia2.wenanku.cc/': web,
+              '{{APP_NAME}}': app,
+              '__APP_NAME__': app,
+              '{{BUNDLE_ID}}': bundle,
+              '__BUNDLE_ID__': bundle,
           }
-          SWIFT
-            python3 - "$VC" "$WEB_URL" <<'PY'
-          import sys
-          p = sys.argv[1]
-          web = sys.argv[2] or 'https://kuangjia2.wenanku.cc/'
-          s = open(p, encoding='utf-8').read().replace('__WEB_URL__', web)
-          open(p, 'w', encoding='utf-8').write(s)
+          changed = 0
+          for path in root.rglob('*'):
+              if not path.is_file() or path.suffix.lower() not in exts:
+                  continue
+              try:
+                  text = path.read_text(encoding='utf-8')
+              except Exception:
+                  continue
+              new_text = text
+              for a, b in replacements.items():
+                  if b:
+                      new_text = new_text.replace(a, b)
+              if new_text != text:
+                  path.write_text(new_text, encoding='utf-8')
+                  changed += 1
+          print('Patched placeholder files:', changed)
           PY
-          fi
 
       - name: Build unsigned app
         run: |
