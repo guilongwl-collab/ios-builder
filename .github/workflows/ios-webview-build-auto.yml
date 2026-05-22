@@ -2,8 +2,6 @@ name: iOS WebView Unsigned Build Auto
 
 on:
   push:
-    branches:
-      - main
     paths:
       - '.ios-build-dispatch/**'
   workflow_dispatch:
@@ -234,13 +232,32 @@ JSON
           set -e
           PROJECT=$(find source -name "*.xcodeproj" | head -1)
           if [ -z "$PROJECT" ]; then echo "No .xcodeproj found"; exit 1; fi
-          SCHEME=$(xcodebuild -list -project "$PROJECT" | awk '/Schemes:/{getline; gsub(/^ +| +$/, ""); print; exit}')
-          if [ -z "$SCHEME" ]; then echo "No scheme found"; exit 1; fi
           mkdir -p build
+          echo "Xcode project: $PROJECT"
+          xcodebuild -list -project "$PROJECT" 2>&1 | tee build/xcodebuild-list.log || true
+          SCHEME=$(xcodebuild -list -project "$PROJECT" 2>/dev/null | awk '/Schemes:/{getline; gsub(/^ +| +$/, ""); print; exit}')
+          TARGET=$(python3 - "$PROJECT" <<'PY'
+          import re, sys, pathlib
+          pbx = pathlib.Path(sys.argv[1]) / 'project.pbxproj'
+          text = pbx.read_text(errors='ignore') if pbx.exists() else ''
+          m = re.search(r'/\* Begin PBXNativeTarget section \*/.*?\n\s*[A-Fa-f0-9]+ /\* ([^*]+) \*/ = \{\n\s*isa = PBXNativeTarget;', text, re.S)
+          print((m.group(1).strip() if m else ''))
+          PY
+          )
+          if [ -n "$SCHEME" ]; then
+            echo "Build by shared scheme: $SCHEME"
+            BUILD_SELECTOR=(-scheme "$SCHEME")
+          elif [ -n "$TARGET" ]; then
+            echo "No shared scheme found, fallback build by target: $TARGET"
+            BUILD_SELECTOR=(-target "$TARGET")
+          else
+            echo "No scheme or native target found"
+            exit 1
+          fi
           set -o pipefail
           xcodebuild \
             -project "$PROJECT" \
-            -scheme "$SCHEME" \
+            "${BUILD_SELECTOR[@]}" \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -273,6 +290,7 @@ JSON
           name: ios-build-logs
           path: |
             build/xcodebuild.log
+            build/xcodebuild-list.log
             /tmp/inputs.json
 
       - name: Upload unsigned IPA artifact
