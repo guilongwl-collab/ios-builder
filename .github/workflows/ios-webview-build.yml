@@ -15,6 +15,9 @@ on:
       web_url:
         description: WebView 网址，可替换 Swift 中的 {{WEB_URL}} 或默认示例地址
         required: false
+      icon_url:
+        description: App 图标下载地址，PNG/JPG，建议 1024x1024
+        required: false
       task_no:
         description: 后台任务编号
         required: false
@@ -35,6 +38,7 @@ jobs:
           APP_NAME="${{ github.event.inputs.app_name }}"
           BUNDLE_ID="${{ github.event.inputs.bundle_id }}"
           WEB_URL="${{ github.event.inputs.web_url }}"
+          ICON_URL="${{ github.event.inputs.icon_url }}"
           if [ -n "$BUNDLE_ID" ]; then
             find source -name project.pbxproj -exec sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]*/PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID/g" {} \;
           fi
@@ -47,6 +51,63 @@ jobs:
               /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$INFO_PLIST" || true
               /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$INFO_PLIST" || true
             fi
+          fi
+          if [ -n "$ICON_URL" ]; then
+            curl -L "$ICON_URL" -o app_icon_input
+            ASSET_DIR=$(find source -name "*.xcassets" -type d | head -1)
+            if [ -z "$ASSET_DIR" ]; then echo "No Assets.xcassets found"; exit 1; fi
+            ICON_SET="$ASSET_DIR/AppIcon.appiconset"
+            rm -rf "$ICON_SET"
+            mkdir -p "$ICON_SET"
+            python3 - <<'PY' > "$ICON_SET/Contents.json"
+import json
+items=[]
+for idiom, sizes in {
+    'iphone':['20','29','40','60'],
+    'ipad':['20','29','40','76','83.5']
+}.items():
+    for size in sizes:
+        scales=['2x','3x'] if idiom=='iphone' else ['1x','2x']
+        if idiom=='ipad' and size=='83.5': scales=['2x']
+        for scale in scales:
+            px=int(float(size)*int(scale[0]))
+            items.append({'idiom':idiom,'size':size+'x'+size,'scale':scale,'filename':f'icon-{idiom}-{size}-{scale}.png','px':px})
+items.append({'idiom':'ios-marketing','size':'1024x1024','scale':'1x','filename':'icon-1024.png','px':1024})
+out={'images':[{k:v for k,v in item.items() if k!='px'} for item in items],'info':{'version':1,'author':'xcode'}}
+print(json.dumps(out, ensure_ascii=False, indent=2))
+PY
+            python3 - <<'PY' > /tmp/icon_sizes.txt
+for idiom, sizes in {
+    'iphone':['20','29','40','60'],
+    'ipad':['20','29','40','76','83.5']
+}.items():
+    for size in sizes:
+        scales=['2x','3x'] if idiom=='iphone' else ['1x','2x']
+        if idiom=='ipad' and size=='83.5': scales=['2x']
+        for scale in scales:
+            px=int(float(size)*int(scale[0]))
+            print(px, f'icon-{idiom}-{size}-{scale}.png')
+print(1024, 'icon-1024.png')
+PY
+            while read -r px filename; do
+              sips -z "$px" "$px" app_icon_input --out "$ICON_SET/$filename" >/dev/null
+            done < /tmp/icon_sizes.txt
+          fi
+
+
+      - name: Patch WKWebView persistence and fixed topbar
+        run: |
+          WEB_URL="${{ github.event.inputs.web_url }}"
+          VC=$(find source -name "ViewController.swift" | head -1)
+          if [ -n "$VC" ]; then
+            python3 - "$VC" "$WEB_URL" <<'PY'
+import json, sys
+vc_path = sys.argv[1]
+web_url = sys.argv[2] or "https://kuangjia2.wenanku.cc/"
+swift = 'import UIKit\nimport WebKit\n\nfinal class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {\n    private let defaultHomeURLString = __WEB_URL__\n    private var webView: WKWebView!\n    private let progressView = UIProgressView(progressViewStyle: .default)\n    private let refreshControl = UIRefreshControl()\n    private let lastURLKey = "AICompanionLastVisitedURL"\n\n    private static let fixedTopbarScript = """\n    (function(){\n      function installStyle(){\n        try {\n          var id = \'ios-webview-fixed-topbar-style\';\n          var old = document.getElementById(id);\n          if (old && old.parentNode) old.parentNode.removeChild(old);\n          var css = `\n            @media (max-width: 900px) {\n              html, body {\n                min-height: 100% !important;\n                -webkit-overflow-scrolling: touch !important;\n              }\n              body.ios-native-webview .topbar,\n              body.ios-native-webview header.topbar {\n                position: fixed !important;\n                top: 0 !important;\n                left: 0 !important;\n                right: 0 !important;\n                width: 100% !important;\n                z-index: 2147483000 !important;\n                transform: translateZ(0) !important;\n                -webkit-transform: translateZ(0) !important;\n                will-change: transform !important;\n                background: rgba(255,255,255,.98) !important;\n                -webkit-backdrop-filter: blur(12px) !important;\n                backdrop-filter: blur(12px) !important;\n              }\n              body.ios-native-webview .main {\n                padding-top: calc(100px + env(safe-area-inset-top, 0px)) !important;\n              }\n              body.ios-native-webview .top-user,\n              body.ios-native-webview .top-user-dropdown {\n                z-index: 2147483200 !important;\n              }\n            }\n          `;\n          var style = document.createElement(\'style\');\n          style.id = id;\n          style.appendChild(document.createTextNode(css));\n          (document.head || document.documentElement).appendChild(style);\n          if (document.body) document.body.classList.add(\'ios-native-webview\');\n        } catch(e) {}\n      }\n      if (document.readyState === \'loading\') {\n        document.addEventListener(\'DOMContentLoaded\', installStyle);\n      } else {\n        installStyle();\n      }\n      setTimeout(installStyle, 300);\n      setTimeout(installStyle, 1000);\n      setTimeout(installStyle, 2200);\n    })();\n    """\n\n    override func loadView() {\n        let userContentController = WKUserContentController()\n        userContentController.addUserScript(WKUserScript(source: Self.fixedTopbarScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))\n\n        let configuration = WKWebViewConfiguration()\n        configuration.websiteDataStore = WKWebsiteDataStore.default()\n        configuration.userContentController = userContentController\n        configuration.allowsInlineMediaPlayback = true\n        configuration.mediaTypesRequiringUserActionForPlayback = []\n        configuration.preferences.javaScriptEnabled = true\n\n        webView = WKWebView(frame: .zero, configuration: configuration)\n        webView.navigationDelegate = self\n        webView.uiDelegate = self\n        webView.allowsBackForwardNavigationGestures = true\n        webView.customUserAgent = "Mozilla/5.0 AiCompanionIOSWebView/1.1"\n        webView.scrollView.contentInsetAdjustmentBehavior = .automatic\n        webView.scrollView.keyboardDismissMode = .interactive\n        view = webView\n    }\n\n    override func viewDidLoad() {\n        super.viewDidLoad()\n        view.backgroundColor = UIColor(red: 0.02, green: 0.74, blue: 0.40, alpha: 1.0)\n        setupProgressView()\n        setupRefreshControl()\n        loadInitialPage()\n    }\n\n    deinit {\n        webView.removeObserver(self, forKeyPath: #keyPath(WKWebView.estimatedProgress))\n    }\n\n    private func setupProgressView() {\n        progressView.translatesAutoresizingMaskIntoConstraints = false\n        progressView.progress = 0\n        view.addSubview(progressView)\n        NSLayoutConstraint.activate([\n            progressView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),\n            progressView.leadingAnchor.constraint(equalTo: view.leadingAnchor),\n            progressView.trailingAnchor.constraint(equalTo: view.trailingAnchor),\n            progressView.heightAnchor.constraint(equalToConstant: 2)\n        ])\n        webView.addObserver(self, forKeyPath: #keyPath(WKWebView.estimatedProgress), options: .new, context: nil)\n    }\n\n    private func setupRefreshControl() {\n        refreshControl.addTarget(self, action: #selector(reloadPage), for: .valueChanged)\n        webView.scrollView.refreshControl = refreshControl\n    }\n\n    private var homeURL: URL {\n        URL(string: defaultHomeURLString) ?? URL(string: "https://kuangjia2.wenanku.cc/")!\n    }\n\n    private func loadInitialPage() {\n        let targetURL: URL\n        if let saved = UserDefaults.standard.string(forKey: lastURLKey),\n           let savedURL = URL(string: saved),\n           shouldRestore(savedURL) {\n            targetURL = savedURL\n        } else {\n            targetURL = homeURL\n        }\n        load(url: targetURL)\n    }\n\n    private func loadHome() {\n        load(url: homeURL)\n    }\n\n    private func load(url: URL) {\n        var request = URLRequest(url: url)\n        request.cachePolicy = .useProtocolCachePolicy\n        webView.load(request)\n    }\n\n    private func shouldRestore(_ url: URL) -> Bool {\n        guard let savedHost = url.host, let homeHost = homeURL.host else { return false }\n        return savedHost == homeHost || savedHost.hasSuffix("." + homeHost)\n    }\n\n    @objc private func reloadPage() {\n        webView.reload()\n    }\n\n    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {\n        guard keyPath == #keyPath(WKWebView.estimatedProgress) else { return }\n        progressView.progress = Float(webView.estimatedProgress)\n        progressView.isHidden = webView.estimatedProgress >= 1.0\n        if progressView.isHidden { progressView.progress = 0 }\n    }\n\n    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {\n        refreshControl.endRefreshing()\n        if let url = webView.url, shouldRestore(url), url.scheme?.hasPrefix("http") == true {\n            UserDefaults.standard.set(url.absoluteString, forKey: lastURLKey)\n        }\n        webView.evaluateJavaScript(Self.fixedTopbarScript, completionHandler: nil)\n    }\n\n    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {\n        refreshControl.endRefreshing()\n        showLoadError(error.localizedDescription)\n    }\n\n    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {\n        refreshControl.endRefreshing()\n        showLoadError(error.localizedDescription)\n    }\n\n    func webView(_ webView: WKWebView,\n                 decidePolicyFor navigationAction: WKNavigationAction,\n                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {\n        if navigationAction.targetFrame == nil, let url = navigationAction.request.url {\n            webView.load(URLRequest(url: url))\n            decisionHandler(.cancel)\n            return\n        }\n        decisionHandler(.allow)\n    }\n\n    private func showLoadError(_ message: String) {\n        let alert = UIAlertController(title: "页面加载失败", message: message, preferredStyle: .alert)\n        alert.addAction(UIAlertAction(title: "重新加载", style: .default) { [weak self] _ in\n            self?.loadHome()\n        })\n        present(alert, animated: true)\n    }\n}\n'
+swift = swift.replace('__WEB_URL__', json.dumps(web_url))
+open(vc_path, 'w', encoding='utf-8').write(swift)
+PY
           fi
 
       - name: Build unsigned app
