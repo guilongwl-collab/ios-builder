@@ -101,6 +101,23 @@ jobs:
               /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$INFO_PLIST" || true
               /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$INFO_PLIST" || true
             fi
+            LAUNCH_STORYBOARD=$(find source -name LaunchScreen.storyboard | head -1)
+            if [ -n "$LAUNCH_STORYBOARD" ]; then
+              python3 - "$LAUNCH_STORYBOARD" "$APP_NAME" <<'PY'
+          import html, re, sys
+          path = sys.argv[1]
+          app_name = sys.argv[2]
+          text = open(path, encoding='utf-8').read()
+          escaped = html.escape(app_name, quote=True)
+          def repl_title(m):
+              return m.group(1) + escaped + m.group(3)
+          updated = re.sub(r'(<label\b[^>]*\bid="title-label"[^>]*\btext=")([^"]*)(")', repl_title, text, count=1)
+          if updated == text:
+              updated = re.sub(r'(<label\b[^>]*\btext=")([^"]*)(")', repl_title, text, count=1)
+          if updated != text:
+              open(path, 'w', encoding='utf-8').write(updated)
+          PY
+            fi
           fi
           if [ -n "$ICON_URL" ]; then
             curl -L "$ICON_URL" -o app_icon_input
