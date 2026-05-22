@@ -152,6 +152,7 @@ jobs:
               private let refreshControl = UIRefreshControl()
               private let lastURLKey = "IOSWebViewLastVisitedURL"
               private let cookieArchiveKey = "IOSWebViewPersistedHTTPCookies"
+              private var downloadAlert: UIAlertController?
 
               private static let fixedTopbarScript = """
               (function(){
@@ -161,18 +162,23 @@ jobs:
                     var old=document.getElementById(id);
                     if(old&&old.parentNode) old.parentNode.removeChild(old);
                     var css=`@media (max-width: 900px){
-                      html,body{min-height:100%!important;-webkit-overflow-scrolling:touch!important;overscroll-behavior-y:none!important;background:#f4f7fb!important;}
+                      html,body{min-height:100%!important;-webkit-overflow-scrolling:touch!important;overscroll-behavior-y:auto!important;background:#f4f7fb!important;}
                       body.ios-native-webview .topbar, body.ios-native-webview header.topbar{
                         position:fixed!important;top:0!important;left:0!important;right:0!important;width:100%!important;
                         z-index:2147483000!important;transform:translateZ(0)!important;-webkit-transform:translateZ(0)!important;
                         background:rgba(255,255,255,.98)!important;-webkit-backdrop-filter:blur(12px)!important;backdrop-filter:blur(12px)!important;
                       }
                       body.ios-native-webview .main{padding-top:calc(100px + env(safe-area-inset-top,0px))!important;}
+                      body.login-body.ios-native-webview.ios-login-page{padding-top:calc(72px + env(safe-area-inset-top,0px))!important;padding-bottom:calc(28px + env(safe-area-inset-bottom,0px))!important;align-items:flex-start!important;}
+                      body.ios-native-webview.ios-login-page .login-card{margin-top:0!important;}
                       body.ios-native-webview .top-user, body.ios-native-webview .top-user-dropdown{z-index:2147483200!important;}
                     }`;
                     var style=document.createElement('style');style.id=id;style.appendChild(document.createTextNode(css));
                     (document.head||document.documentElement).appendChild(style);
-                    if(document.body) document.body.classList.add('ios-native-webview');
+                    if(document.body) {
+                      document.body.classList.add('ios-native-webview');
+                      if(document.body.classList.contains('login-body') || document.querySelector('.login-card')) document.body.classList.add('ios-login-page');
+                    }
                   } catch(e) {}
                 }
                 if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',installStyle);}else{installStyle();}
@@ -196,8 +202,8 @@ jobs:
                   webView.backgroundColor = UIColor(red: 0.96, green: 0.97, blue: 0.99, alpha: 1.0)
                   webView.scrollView.backgroundColor = webView.backgroundColor
                   webView.scrollView.contentInsetAdjustmentBehavior = .never
-                  webView.scrollView.bounces = false
-                  webView.scrollView.alwaysBounceVertical = false
+                  webView.scrollView.bounces = true
+                  webView.scrollView.alwaysBounceVertical = true
                   webView.scrollView.keyboardDismissMode = .interactive
                   view = webView
                   view.backgroundColor = webView.backgroundColor
@@ -209,6 +215,12 @@ jobs:
                   setupRefreshControl()
                   installLifecycleObservers()
                   restoreCookiesThenLoad()
+              }
+
+              override func viewDidLayoutSubviews() {
+                  super.viewDidLayoutSubviews()
+                  webView.scrollView.verticalScrollIndicatorInsets.top = view.safeAreaInsets.top
+                  webView.scrollView.verticalScrollIndicatorInsets.bottom = view.safeAreaInsets.bottom
               }
 
               deinit {
@@ -230,6 +242,8 @@ jobs:
               }
 
               private func setupRefreshControl() {
+                  refreshControl.tintColor = UIColor(red: 0.03, green: 0.74, blue: 0.40, alpha: 1.0)
+                  refreshControl.attributedTitle = NSAttributedString(string: "下拉刷新", attributes: [.foregroundColor: UIColor(red: 0.45, green: 0.52, blue: 0.62, alpha: 1.0)])
                   refreshControl.addTarget(self, action: #selector(reloadPage), for: .valueChanged)
                   webView.scrollView.refreshControl = refreshControl
               }
@@ -306,7 +320,121 @@ jobs:
                   return url.path.lowercased().contains("login.php")
               }
 
-              @objc private func reloadPage() { webView.reload() }
+              @objc private func reloadPage() {
+                  if webView.url == nil {
+                      loadInitialPage()
+                  } else {
+                      webView.reload()
+                  }
+              }
+
+              private func isDownloadURL(_ url: URL) -> Bool {
+                  let path = url.path.lowercased()
+                  let query = (url.query ?? "").lowercased()
+                  let fileExt = url.pathExtension.lowercased()
+                  let downloadExts: Set<String> = ["ipa", "zip", "mobileconfig", "p12", "cer", "deb", "dylib", "framework"]
+                  if downloadExts.contains(fileExt) { return true }
+                  if query.contains("download=ipa") || query.contains("download=artifact") || query.contains("download=source") || query.contains("download=zip") { return true }
+                  if path.contains("/api/ios_build/package.php") { return true }
+                  return false
+              }
+
+              private func downloadFile(from url: URL) {
+                  showDownloadAlert("正在准备下载…")
+                  let store = webView.configuration.websiteDataStore.httpCookieStore
+                  store.getAllCookies { [weak self] cookies in
+                      guard let self = self else { return }
+                      var request = URLRequest(url: url)
+                      request.httpShouldHandleCookies = true
+                      let cookieHeader = HTTPCookie.requestHeaderFields(with: cookies)
+                      for (key, value) in cookieHeader { request.setValue(value, forHTTPHeaderField: key) }
+                      let task = URLSession.shared.downloadTask(with: request) { [weak self] tempURL, response, error in
+                          guard let self = self else { return }
+                          if let error = error {
+                              DispatchQueue.main.async { self.showDownloadError("下载失败：\(error.localizedDescription)") }
+                              return
+                          }
+                          guard let tempURL = tempURL else {
+                              DispatchQueue.main.async { self.showDownloadError("下载失败：未获取到文件") }
+                              return
+                          }
+                          let fileName = self.filenameForDownload(url: url, response: response)
+                          do {
+                              let dir = FileManager.default.temporaryDirectory.appendingPathComponent("IOSWebViewDownloads", isDirectory: true)
+                              try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                              let dest = dir.appendingPathComponent(fileName)
+                              if FileManager.default.fileExists(atPath: dest.path) { try FileManager.default.removeItem(at: dest) }
+                              try FileManager.default.moveItem(at: tempURL, to: dest)
+                              DispatchQueue.main.async { self.presentDownloadedFile(dest) }
+                          } catch {
+                              DispatchQueue.main.async { self.showDownloadError("保存失败：\(error.localizedDescription)") }
+                          }
+                      }
+                      task.resume()
+                  }
+              }
+
+              private func filenameForDownload(url: URL, response: URLResponse?) -> String {
+                  if let suggested = response?.suggestedFilename, !suggested.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                      return sanitizeFilename(suggested)
+                  }
+                  let query = (url.query ?? "").lowercased()
+                  var name = url.lastPathComponent
+                  if name.isEmpty || !name.contains(".") {
+                      if query.contains("download=ipa") { name = "ios_app.ipa" }
+                      else if query.contains("download=source") || query.contains("download=artifact") || query.contains("download=zip") { name = "ios_build.zip" }
+                      else { name = "download.zip" }
+                  }
+                  return sanitizeFilename(name)
+              }
+
+              private func sanitizeFilename(_ name: String) -> String {
+                  let invalid = CharacterSet(charactersIn: "/\\?%*|\"<>:")
+                  let parts = name.components(separatedBy: invalid).filter { !$0.isEmpty }
+                  let cleaned = parts.joined(separator: "_")
+                  return cleaned.isEmpty ? "download" : cleaned
+              }
+
+              private func showDownloadAlert(_ message: String) {
+                  if let alert = downloadAlert {
+                      alert.message = message
+                      return
+                  }
+                  let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+                  downloadAlert = alert
+                  present(alert, animated: true)
+              }
+
+              private func dismissDownloadAlert(completion: (() -> Void)? = nil) {
+                  if let alert = downloadAlert {
+                      downloadAlert = nil
+                      alert.dismiss(animated: true, completion: completion)
+                  } else {
+                      completion?()
+                  }
+              }
+
+              private func showDownloadError(_ message: String) {
+                  dismissDownloadAlert { [weak self] in
+                      guard let self = self else { return }
+                      let alert = UIAlertController(title: "下载失败", message: message, preferredStyle: .alert)
+                      alert.addAction(UIAlertAction(title: "确定", style: .default))
+                      self.present(alert, animated: true)
+                  }
+              }
+
+              private func presentDownloadedFile(_ fileURL: URL) {
+                  dismissDownloadAlert { [weak self] in
+                      guard let self = self else { return }
+                      let activity = UIActivityViewController(activityItems: [fileURL], applicationActivities: nil)
+                      if let popover = activity.popoverPresentationController {
+                          popover.sourceView = self.view
+                          popover.sourceRect = CGRect(x: self.view.bounds.midX, y: self.view.bounds.midY, width: 1, height: 1)
+                          popover.permittedArrowDirections = []
+                      }
+                      self.present(activity, animated: true)
+                  }
+              }
 
               override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
                   guard keyPath == #keyPath(WKWebView.estimatedProgress) else { return }
@@ -328,7 +456,13 @@ jobs:
               func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { refreshControl.endRefreshing() }
 
               func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-                  if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
+                  guard let url = navigationAction.request.url else { decisionHandler(.allow); return }
+                  if isDownloadURL(url) {
+                      downloadFile(from: url)
+                      decisionHandler(.cancel)
+                      return
+                  }
+                  if navigationAction.targetFrame == nil {
                       webView.load(URLRequest(url: url)); decisionHandler(.cancel); return
                   }
                   decisionHandler(.allow)
