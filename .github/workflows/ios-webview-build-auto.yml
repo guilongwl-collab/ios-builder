@@ -25,6 +25,10 @@ on:
         description: 后台任务编号
         required: false
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   build-ios:
     runs-on: macos-14
@@ -36,103 +40,116 @@ jobs:
         run: |
           set -e
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            cat > /tmp/inputs.json <<'JSON'
-          {
+            python3 - <<'PY' > /tmp/inputs.json
+          import json
+          data = {
             "package_url": "${{ github.event.inputs.package_url }}",
             "app_name": "${{ github.event.inputs.app_name }}",
             "bundle_id": "${{ github.event.inputs.bundle_id }}",
             "web_url": "${{ github.event.inputs.web_url }}",
             "icon_url": "${{ github.event.inputs.icon_url }}",
-            "task_no": "${{ github.event.inputs.task_no }}"
+            "task_no": "${{ github.event.inputs.task_no }}",
           }
-          JSON
+          print(json.dumps(data, ensure_ascii=False))
+          PY
           else
             DISPATCH_FILE=$(find .ios-build-dispatch -name "*.json" -type f | sort | tail -1)
             if [ -z "$DISPATCH_FILE" ]; then echo "No dispatch json found"; exit 1; fi
             cp "$DISPATCH_FILE" /tmp/inputs.json
           fi
           python3 - <<'PY'
-          import json, os, shlex
+          import json, os
           data = json.load(open('/tmp/inputs.json', encoding='utf-8'))
-          keys = {
-              'package_url': 'PACKAGE_URL',
-              'app_name': 'APP_NAME',
-              'bundle_id': 'BUNDLE_ID',
-              'web_url': 'WEB_URL',
-              'icon_url': 'ICON_URL',
-              'task_no': 'TASK_NO',
-          }
-          with open('/tmp/inputs.env', 'w', encoding='utf-8') as sf, open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as gf:
+          keys = {'package_url':'PACKAGE_URL','app_name':'APP_NAME','bundle_id':'BUNDLE_ID','web_url':'WEB_URL','icon_url':'ICON_URL','task_no':'TASK_NO'}
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as gf:
               for k, env in keys.items():
-                  v = str(data.get(k, '') or '')
-                  sf.write('export %s=%s\n' % (env, shlex.quote(v)))
-                  gf.write('%s=%s\n' % (env, v.replace('\n', ' ')))
+                  v = str(data.get(k, '') or '').replace('\n', ' ').replace('\r', ' ')
+                  gf.write(f'{env}<<__IOS_BUILD_VALUE__\n{v}\n__IOS_BUILD_VALUE__\n')
           PY
-          source /tmp/inputs.env
           if [ -z "$PACKAGE_URL" ]; then echo "Missing package_url"; exit 1; fi
           echo "Task: ${TASK_NO}"
           echo "Bundle ID: ${BUNDLE_ID}"
           echo "Web URL: ${WEB_URL}"
+          echo "Icon URL: ${ICON_URL}"
+          sw_vers || true
+          xcodebuild -version || true
 
       - name: Download source package
         run: |
           set -e
-          curl -L "$PACKAGE_URL" -o package.zip
-          mkdir -p source
-          unzip -q package.zip -d source
-          find source -maxdepth 4 -type f | head -80
+          rm -rf source build package.zip
+          mkdir -p source build
+          curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 "$PACKAGE_URL" -o package.zip
+          ls -lah package.zip
+          file package.zip || true
+          python3 - <<'PY'
+          import sys, zipfile
+          if not zipfile.is_zipfile('package.zip'):
+              print('Downloaded file is not a valid ZIP package')
+              sys.exit(1)
+          with zipfile.ZipFile('package.zip') as z:
+              bad = z.testzip()
+              if bad:
+                  print('ZIP test failed at', bad)
+                  sys.exit(1)
+              z.extractall('source')
+          PY
+          find source -maxdepth 5 -type f | sed 's#^#  #' | head -120
 
-      - name: Patch app metadata and icon
+      - name: Patch app metadata and uploaded icon
         run: |
           set -e
-          PROJECT=$(find source -name "*.xcodeproj" | head -1)
+          mkdir -p build
+          PROJECT=$(find source -name "*.xcodeproj" -type d | head -1)
           if [ -z "$PROJECT" ]; then echo "No .xcodeproj found"; exit 1; fi
-          if [ -n "$BUNDLE_ID" ]; then
-            find source -name project.pbxproj -exec sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]*/PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID/g" {} \;
-          fi
-          if [ -n "$WEB_URL" ]; then
-            grep -RIl "{{WEB_URL}}\|https://kuangjia2.wenanku.cc/" source --include='*.swift' | xargs -I{} sed -i '' "s#{{WEB_URL}}#$WEB_URL#g; s#https://kuangjia2.wenanku.cc/#$WEB_URL#g" {} || true
-          fi
-          if [ -n "$APP_NAME" ]; then
-            INFO_PLIST=$(find source -name Info.plist | head -1)
-            if [ -n "$INFO_PLIST" ]; then
-              /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$INFO_PLIST" || true
-              /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$INFO_PLIST" || true
-            fi
-            LAUNCH_STORYBOARD=$(find source -name LaunchScreen.storyboard | head -1)
-            if [ -n "$LAUNCH_STORYBOARD" ]; then
-              python3 - "$LAUNCH_STORYBOARD" "$APP_NAME" <<'PY'
-          import html, re, sys
-          path = sys.argv[1]
-          app_name = sys.argv[2]
-          text = open(path, encoding='utf-8').read()
-          escaped = html.escape(app_name, quote=True)
-          def repl_title(m):
-              return m.group(1) + escaped + m.group(3)
-          updated = re.sub(r'(<label\b[^>]*\bid="title-label"[^>]*\btext=")([^"]*)(")', repl_title, text, count=1)
-          if updated == text:
-              updated = re.sub(r'(<label\b[^>]*\btext=")([^"]*)(")', repl_title, text, count=1)
-          if updated != text:
-              open(path, 'w', encoding='utf-8').write(updated)
+          echo "Xcode project: $PROJECT"
+          python3 - <<'PY'
+          import html, json, os, pathlib, re
+          root = pathlib.Path('source')
+          app = os.environ.get('APP_NAME','') or 'App'
+          bundle = os.environ.get('BUNDLE_ID','') or ''
+          web = os.environ.get('WEB_URL','') or ''
+          def swift_string(v): return json.dumps(v, ensure_ascii=False)
+          for pbx in root.rglob('project.pbxproj'):
+              text = pbx.read_text(errors='ignore')
+              if bundle:
+                  text = re.sub(r'PRODUCT_BUNDLE_IDENTIFIER = [^;]+;', f'PRODUCT_BUNDLE_IDENTIFIER = {bundle};', text)
+              text = re.sub(r'CODE_SIGN_STYLE = Automatic;', 'CODE_SIGN_STYLE = Manual;', text)
+              pbx.write_text(text)
+          for swift in root.rglob('AppConfig.swift'):
+              text = swift.read_text(encoding='utf-8', errors='ignore')
+              if app:
+                  text = re.sub(r'static\s+let\s+appName\s*=\s*"[^"]*"', 'static let appName = ' + swift_string(app), text)
+              if web:
+                  text = re.sub(r'static\s+let\s+initialURLString\s*=\s*"[^"]*"', 'static let initialURLString = ' + swift_string(web), text)
+              swift.write_text(text, encoding='utf-8')
+          replacements = {'{{WEB_URL}}':web,'__WEB_URL__':web,'https://kuangjia2.wenanku.cc/':web,'{{APP_NAME}}':app,'__APP_NAME__':app,'{{BUNDLE_ID}}':bundle,'__BUNDLE_ID__':bundle}
+          for path in root.rglob('*'):
+              if not path.is_file() or path.suffix.lower() not in {'.swift','.plist','.storyboard','.xib'}: continue
+              try: text = path.read_text(encoding='utf-8')
+              except Exception: continue
+              new = text
+              for a,b in replacements.items():
+                  if b: new = new.replace(a,b)
+              if path.name == 'Info.plist' and app:
+                  if '<key>CFBundleDisplayName</key>' in new:
+                      new = re.sub(r'<key>CFBundleDisplayName</key>\s*<string>[^<]*</string>', '<key>CFBundleDisplayName</key>\n\t<string>'+html.escape(app)+'</string>', new)
+              if new != text: path.write_text(new, encoding='utf-8')
           PY
-            fi
+          ASSET_DIR=$(find source -name "*.xcassets" -type d | head -1)
+          if [ -n "$ASSET_DIR" ]; then
+            mkdir -p "$ASSET_DIR/AccentColor.colorset"
+            cat > "$ASSET_DIR/AccentColor.colorset/Contents.json" <<'JSON'
+          {"colors":[{"idiom":"universal","color":{"color-space":"srgb","components":{"red":"0.239","green":"0.627","blue":"0.992","alpha":"1.000"}}}],"info":{"author":"xcode","version":1}}
+          JSON
           fi
-          if [ -n "$ICON_URL" ]; then
-            echo "Download uploaded App icon from backend parameter"
-            if ! curl -fL --retry 2 --connect-timeout 20 "$ICON_URL" -o app_icon_input; then
-              echo "Icon download failed, keep source project default icon"
-              ICON_URL=""
-            fi
-          fi
-          if [ -n "$ICON_URL" ] && [ -s app_icon_input ]; then
-            ASSET_DIR=$(find source -name "*.xcassets" -type d | head -1)
-            if [ -z "$ASSET_DIR" ]; then echo "No Assets.xcassets found"; exit 1; fi
-
-            # AppIcon.appiconset 用于 iOS 安装图标：统一生成无裁剪的标准尺寸，降低 Xcode 编译失败概率。
-            ICON_SET="$ASSET_DIR/AppIcon.appiconset"
-            rm -rf "$ICON_SET"
-            mkdir -p "$ICON_SET"
-            python3 - <<'PY' > "$ICON_SET/Contents.json"
+          if [ -n "$ICON_URL" ] && [ -n "$ASSET_DIR" ]; then
+            echo "Downloading uploaded App icon parameter..."
+            if curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 "$ICON_URL" -o /tmp/app_icon_input; then
+              if sips -g pixelWidth /tmp/app_icon_input >/dev/null 2>&1; then
+                if sips -s format png /tmp/app_icon_input --out /tmp/app_icon_source.png >/dev/null 2>&1; then ICON_SOURCE=/tmp/app_icon_source.png; else ICON_SOURCE=/tmp/app_icon_input; fi
+                ICON_SET="$ASSET_DIR/AppIcon.appiconset"; rm -rf "$ICON_SET"; mkdir -p "$ICON_SET"
+                python3 - <<'PY' > "$ICON_SET/Contents.json"
           import json
           items=[]
           for idiom, sizes in {'iphone':['20','29','40','60'], 'ipad':['20','29','40','76','83.5']}.items():
@@ -140,103 +157,53 @@ jobs:
                   scales=['2x','3x'] if idiom=='iphone' else ['1x','2x']
                   if idiom=='ipad' and size=='83.5': scales=['2x']
                   for scale in scales:
-                      px=int(float(size)*int(scale[0]))
-                      items.append({'idiom':idiom,'size':size+'x'+size,'scale':scale,'filename':f'icon-{idiom}-{size}-{scale}.png','px':px})
+                      px=int(float(size)*int(scale[0])); items.append({'idiom':idiom,'size':size+'x'+size,'scale':scale,'filename':f'icon-{idiom}-{size}-{scale}.png','px':px})
           items.append({'idiom':'ios-marketing','size':'1024x1024','scale':'1x','filename':'icon-1024.png','px':1024})
           print(json.dumps({'images':[{k:v for k,v in x.items() if k!='px'} for x in items], 'info':{'version':1,'author':'xcode'}}, ensure_ascii=False, indent=2))
           PY
-            python3 - <<'PY' > /tmp/icon_sizes.txt
+                python3 - <<'PY' > /tmp/icon_sizes.txt
           for idiom, sizes in {'iphone':['20','29','40','60'], 'ipad':['20','29','40','76','83.5']}.items():
               for size in sizes:
                   scales=['2x','3x'] if idiom=='iphone' else ['1x','2x']
                   if idiom=='ipad' and size=='83.5': scales=['2x']
-                  for scale in scales:
-                      print(int(float(size)*int(scale[0])), f'icon-{idiom}-{size}-{scale}.png')
+                  for scale in scales: print(int(float(size)*int(scale[0])), f'icon-{idiom}-{size}-{scale}.png')
           print(1024, 'icon-1024.png')
           PY
-            ICON_SOURCE="app_icon_input"
-            if sips -s format png app_icon_input --out /tmp/app_icon_source.png >/dev/null 2>&1; then
-              ICON_SOURCE="/tmp/app_icon_source.png"
-            fi
-            while read -r px filename; do
-              if ! sips -z "$px" "$px" "$ICON_SOURCE" --out "$ICON_SET/$filename" >/dev/null 2>&1; then
-                echo "Failed to generate icon size $px for $filename"
-                exit 1
+                while read -r px filename; do sips -z "$px" "$px" "$ICON_SOURCE" --out "$ICON_SET/$filename" >/dev/null; done < /tmp/icon_sizes.txt
+                DISPLAY_SET="$ASSET_DIR/AppDisplayIcon.imageset"; rm -rf "$DISPLAY_SET"; mkdir -p "$DISPLAY_SET"
+                sips -s format png /tmp/app_icon_input --out "$DISPLAY_SET/AppDisplayIcon.png" >/dev/null 2>&1 || cp "$ICON_SOURCE" "$DISPLAY_SET/AppDisplayIcon.png"
+                cat > "$DISPLAY_SET/Contents.json" <<'JSON'
+          {"images":[{"filename":"AppDisplayIcon.png","idiom":"universal","scale":"1x"}],"info":{"author":"xcode","version":1}}
+          JSON
+                echo "Uploaded App icon parameter has been written to AppIcon and AppDisplayIcon."
+              else
+                echo "Uploaded icon is not a valid image; keep source project icon and continue build."
               fi
-            done < /tmp/icon_sizes.txt
-
-            # AppDisplayIcon.imageset 用于启动页展示：只做格式转换，完整显示用户上传的图标参数，不裁剪、不抠图。
-            DISPLAY_SET="$ASSET_DIR/AppDisplayIcon.imageset"
-            rm -rf "$DISPLAY_SET"
-            mkdir -p "$DISPLAY_SET"
-            if ! sips -s format png app_icon_input --out "$DISPLAY_SET/AppDisplayIcon.png" >/dev/null 2>&1; then
-              cp app_icon_input "$DISPLAY_SET/AppDisplayIcon.png"
+            else
+              echo "Icon download failed; keep source project icon and continue build."
             fi
-            cat > "$DISPLAY_SET/Contents.json" <<'JSON'
-{
-  "images": [
-    {
-      "filename": "AppDisplayIcon.png",
-      "idiom": "universal",
-      "scale": "1x"
-    }
-  ],
-  "info": {
-    "author": "xcode",
-    "version": 1
-  }
-}
-JSON
           fi
-
-      - name: Patch uploaded app metadata placeholders
-        run: |
-          set -e
-          echo "Keep uploaded Xcode WebView shell source. Only patch placeholders and metadata."
-          python3 - <<'PY'
-          import os, pathlib, sys
-          web = os.environ.get('WEB_URL', '') or 'https://kuangjia2.wenanku.cc/'
-          app = os.environ.get('APP_NAME', '') or ''
-          bundle = os.environ.get('BUNDLE_ID', '') or ''
-          root = pathlib.Path('source')
-          exts = {'.swift', '.plist', '.storyboard', '.xib'}
-          replacements = {
-              '{{WEB_URL}}': web,
-              '__WEB_URL__': web,
-              'https://kuangjia2.wenanku.cc/': web,
-              '{{APP_NAME}}': app,
-              '__APP_NAME__': app,
-              '{{BUNDLE_ID}}': bundle,
-              '__BUNDLE_ID__': bundle,
-          }
-          changed = 0
-          for path in root.rglob('*'):
-              if not path.is_file() or path.suffix.lower() not in exts:
-                  continue
-              try:
-                  text = path.read_text(encoding='utf-8')
-              except Exception:
-                  continue
-              new_text = text
-              for a, b in replacements.items():
-                  if b:
-                      new_text = new_text.replace(a, b)
-              if new_text != text:
-                  path.write_text(new_text, encoding='utf-8')
-                  changed += 1
-          print('Patched placeholder files:', changed)
-          PY
 
       - name: Build unsigned app
         run: |
           set -e
-          PROJECT=$(find source -name "*.xcodeproj" | head -1)
-          if [ -z "$PROJECT" ]; then echo "No .xcodeproj found"; exit 1; fi
+          set -o pipefail
           mkdir -p build
-          echo "Xcode project: $PROJECT"
-          xcodebuild -list -project "$PROJECT" 2>&1 | tee build/xcodebuild-list.log || true
-          SCHEME=$(xcodebuild -list -project "$PROJECT" 2>/dev/null | awk '/Schemes:/{getline; gsub(/^ +| +$/, ""); print; exit}')
-          TARGET=$(python3 - "$PROJECT" <<'PY'
+          PROJECT=$(find source -name "*.xcodeproj" -type d | head -1)
+          WORKSPACE=$(find source -name "*.xcworkspace" -type d | head -1)
+          if [ -z "$PROJECT" ] && [ -z "$WORKSPACE" ]; then echo "No Xcode project/workspace found"; exit 1; fi
+          if [ -n "$WORKSPACE" ]; then
+            CONTAINER_ARGS=(-workspace "$WORKSPACE")
+            xcodebuild -list -workspace "$WORKSPACE" 2>&1 | tee build/xcodebuild-list.log || true
+            SCHEME=$(xcodebuild -list -workspace "$WORKSPACE" 2>/dev/null | awk '/Schemes:/{getline; gsub(/^ +| +$/, ""); print; exit}')
+          else
+            CONTAINER_ARGS=(-project "$PROJECT")
+            xcodebuild -list -project "$PROJECT" 2>&1 | tee build/xcodebuild-list.log || true
+            SCHEME=$(xcodebuild -list -project "$PROJECT" 2>/dev/null | awk '/Schemes:/{getline; gsub(/^ +| +$/, ""); print; exit}')
+          fi
+          TARGET=""
+          if [ -z "$SCHEME" ] && [ -n "$PROJECT" ]; then
+            TARGET=$(python3 - "$PROJECT" <<'PY'
           import re, sys, pathlib
           pbx = pathlib.Path(sys.argv[1]) / 'project.pbxproj'
           text = pbx.read_text(errors='ignore') if pbx.exists() else ''
@@ -244,37 +211,15 @@ JSON
           print((m.group(1).strip() if m else ''))
           PY
           )
-          if [ -n "$SCHEME" ]; then
-            echo "Build by shared scheme: $SCHEME"
-            BUILD_SELECTOR=(-scheme "$SCHEME")
-          elif [ -n "$TARGET" ]; then
-            echo "No shared scheme found, fallback build by target: $TARGET"
-            BUILD_SELECTOR=(-target "$TARGET")
-          else
-            echo "No scheme or native target found"
-            exit 1
           fi
-          set -o pipefail
-          xcodebuild \
-            -project "$PROJECT" \
-            "${BUILD_SELECTOR[@]}" \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$PWD/build/DerivedData" \
-            clean build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER="" 2>&1 | tee build/xcodebuild.log
+          if [ -n "$SCHEME" ]; then BUILD_SELECTOR=(-scheme "$SCHEME"); echo "Build by scheme: $SCHEME"; elif [ -n "$TARGET" ]; then BUILD_SELECTOR=(-target "$TARGET"); echo "Build by target: $TARGET"; else echo "No scheme or native target found"; exit 1; fi
+          xcodebuild "${CONTAINER_ARGS[@]}" "${BUILD_SELECTOR[@]}" -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$PWD/build/DerivedData" clean build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER="" ONLY_ACTIVE_ARCH=NO 2>&1 | tee build/xcodebuild.log
 
       - name: Package unsigned IPA
         run: |
           set -e
           APP_PATH=$(find build/DerivedData -path "*/Build/Products/Release-iphoneos/*.app" -type d | head -1)
-          if [ -z "$APP_PATH" ]; then echo "No .app found"; find build/DerivedData -maxdepth 8 -type d | tail -50; exit 1; fi
+          if [ -z "$APP_PATH" ]; then echo "No .app found"; find build/DerivedData -maxdepth 8 -type d | tail -80; exit 1; fi
           mkdir -p build/ipa/Payload
           cp -R "$APP_PATH" build/ipa/Payload/
           cd build/ipa
@@ -288,10 +233,12 @@ JSON
         uses: actions/upload-artifact@v4
         with:
           name: ios-build-logs
+          if-no-files-found: warn
           path: |
             build/xcodebuild.log
             build/xcodebuild-list.log
             /tmp/inputs.json
+            package.zip
 
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
