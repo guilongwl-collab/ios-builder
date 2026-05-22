@@ -53,19 +53,29 @@ jobs:
           print(json.dumps(data, ensure_ascii=False))
           PY
           else
-            DISPATCH_FILE=$(find .ios-build-dispatch -name "*.json" -type f | sort | tail -1)
-            if [ -z "$DISPATCH_FILE" ]; then echo "No dispatch json found"; exit 1; fi
+            DISPATCH_FILE=""
+            if [ -d ".ios-build-dispatch" ]; then
+              DISPATCH_FILE=$(find .ios-build-dispatch -name "*.json" -type f | sort | tail -1 || true)
+            fi
+            if [ -z "$DISPATCH_FILE" ]; then
+              echo "No dispatch json found in current checkout."
+              echo "This run was triggered without task inputs. Ignore this run and trigger again after installing the latest backend patch."
+              git log --name-only -n 3 || true
+              exit 64
+            fi
             cp "$DISPATCH_FILE" /tmp/inputs.json
           fi
           python3 - <<'PY'
-          import json, os
+          import json, os, shlex
           data = json.load(open('/tmp/inputs.json', encoding='utf-8'))
           keys = {'package_url':'PACKAGE_URL','app_name':'APP_NAME','bundle_id':'BUNDLE_ID','web_url':'WEB_URL','icon_url':'ICON_URL','task_no':'TASK_NO'}
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as gf:
+          with open('/tmp/inputs.env', 'w', encoding='utf-8') as sf, open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as gf:
               for k, env in keys.items():
                   v = str(data.get(k, '') or '').replace('\n', ' ').replace('\r', ' ')
+                  sf.write('export %s=%s\n' % (env, shlex.quote(v)))
                   gf.write(f'{env}<<__IOS_BUILD_VALUE__\n{v}\n__IOS_BUILD_VALUE__\n')
           PY
+          . /tmp/inputs.env
           if [ -z "$PACKAGE_URL" ]; then echo "Missing package_url"; exit 1; fi
           echo "Task: ${TASK_NO}"
           echo "Bundle ID: ${BUNDLE_ID}"
