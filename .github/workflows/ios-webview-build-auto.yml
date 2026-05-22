@@ -151,6 +151,30 @@ jobs:
             while read -r px filename; do
               sips -z "$px" "$px" app_icon_input --out "$ICON_SET/$filename" >/dev/null
             done < /tmp/icon_sizes.txt
+
+            # 同步生成启动页展示图标资源。这里必须直接使用上传工程页传入的 App 图标参数，
+            # 只做格式转换，不裁剪、不重新抠图、不从截图提取，确保启动页显示和上传图标一致。
+            DISPLAY_SET="$ASSET_DIR/AppDisplayIcon.imageset"
+            rm -rf "$DISPLAY_SET"
+            mkdir -p "$DISPLAY_SET"
+            if ! sips -s format png app_icon_input --out "$DISPLAY_SET/AppDisplayIcon.png" >/dev/null 2>&1; then
+              cp app_icon_input "$DISPLAY_SET/AppDisplayIcon.png"
+            fi
+            cat > "$DISPLAY_SET/Contents.json" <<'JSON'
+{
+  "images": [
+    {
+      "filename": "AppDisplayIcon.png",
+      "idiom": "universal",
+      "scale": "1x"
+    }
+  ],
+  "info": {
+    "author": "xcode",
+    "version": 1
+  }
+}
+JSON
           fi
 
       - name: Patch uploaded app metadata placeholders
