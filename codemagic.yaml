@@ -1,0 +1,20 @@
+workflows:
+  ios-webview-debug:
+    name: AI伴侣 iOS WebView Build
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: latest
+      vars:
+        XCODE_PROJECT: "AiCompanion.xcodeproj"
+        XCODE_SCHEME: "AiCompanion"
+    scripts:
+      - name: Show Xcode version
+        script: xcodebuild -version
+      - name: Resolve project
+        script: xcodebuild -list -project "$XCODE_PROJECT"
+      - name: Build archive
+        script: |
+          xcodebuild archive             -project "$XCODE_PROJECT"             -scheme "$XCODE_SCHEME"             -configuration Release             -archivePath "$CM_BUILD_DIR/build/AiCompanion.xcarchive"             CODE_SIGNING_ALLOWED=NO
+    artifacts:
+      - build/**/*.xcarchive
