@@ -120,9 +120,17 @@ jobs:
             fi
           fi
           if [ -n "$ICON_URL" ]; then
-            curl -L "$ICON_URL" -o app_icon_input
+            echo "Download uploaded App icon from backend parameter"
+            if ! curl -fL --retry 2 --connect-timeout 20 "$ICON_URL" -o app_icon_input; then
+              echo "Icon download failed, keep source project default icon"
+              ICON_URL=""
+            fi
+          fi
+          if [ -n "$ICON_URL" ] && [ -s app_icon_input ]; then
             ASSET_DIR=$(find source -name "*.xcassets" -type d | head -1)
             if [ -z "$ASSET_DIR" ]; then echo "No Assets.xcassets found"; exit 1; fi
+
+            # AppIcon.appiconset 用于 iOS 安装图标：统一生成无裁剪的标准尺寸，降低 Xcode 编译失败概率。
             ICON_SET="$ASSET_DIR/AppIcon.appiconset"
             rm -rf "$ICON_SET"
             mkdir -p "$ICON_SET"
@@ -148,12 +156,18 @@ jobs:
                       print(int(float(size)*int(scale[0])), f'icon-{idiom}-{size}-{scale}.png')
           print(1024, 'icon-1024.png')
           PY
+            ICON_SOURCE="app_icon_input"
+            if sips -s format png app_icon_input --out /tmp/app_icon_source.png >/dev/null 2>&1; then
+              ICON_SOURCE="/tmp/app_icon_source.png"
+            fi
             while read -r px filename; do
-              sips -z "$px" "$px" app_icon_input --out "$ICON_SET/$filename" >/dev/null
+              if ! sips -z "$px" "$px" "$ICON_SOURCE" --out "$ICON_SET/$filename" >/dev/null 2>&1; then
+                echo "Failed to generate icon size $px for $filename"
+                exit 1
+              fi
             done < /tmp/icon_sizes.txt
 
-            # 同步生成启动页展示图标资源。这里必须直接使用上传工程页传入的 App 图标参数，
-            # 只做格式转换，不裁剪、不重新抠图、不从截图提取，确保启动页显示和上传图标一致。
+            # AppDisplayIcon.imageset 用于启动页展示：只做格式转换，完整显示用户上传的图标参数，不裁剪、不抠图。
             DISPLAY_SET="$ASSET_DIR/AppDisplayIcon.imageset"
             rm -rf "$DISPLAY_SET"
             mkdir -p "$DISPLAY_SET"
@@ -223,6 +237,7 @@ JSON
           SCHEME=$(xcodebuild -list -project "$PROJECT" | awk '/Schemes:/{getline; gsub(/^ +| +$/, ""); print; exit}')
           if [ -z "$SCHEME" ]; then echo "No scheme found"; exit 1; fi
           mkdir -p build
+          set -o pipefail
           xcodebuild \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
@@ -234,8 +249,9 @@ JSON
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER=""
+            PROVISIONING_PROFILE_SPECIFIER="" 2>&1 | tee build/xcodebuild.log
 
       - name: Package unsigned IPA
         run: |
@@ -249,6 +265,15 @@ JSON
           zip -qry "../unsigned-${SAFE_TASK_NO}.ipa" Payload
           cd ../..
           ls -lah build/*.ipa
+
+      - name: Upload build logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-logs
+          path: |
+            build/xcodebuild.log
+            /tmp/inputs.json
 
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
