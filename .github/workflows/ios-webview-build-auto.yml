@@ -151,6 +151,7 @@ jobs:
               private let progressView = UIProgressView(progressViewStyle: .default)
               private let refreshControl = UIRefreshControl()
               private let lastURLKey = "IOSWebViewLastVisitedURL"
+              private let cookieArchiveKey = "IOSWebViewPersistedHTTPCookies"
 
               private static let fixedTopbarScript = """
               (function(){
@@ -160,7 +161,7 @@ jobs:
                     var old=document.getElementById(id);
                     if(old&&old.parentNode) old.parentNode.removeChild(old);
                     var css=`@media (max-width: 900px){
-                      html,body{min-height:100%!important;-webkit-overflow-scrolling:touch!important;}
+                      html,body{min-height:100%!important;-webkit-overflow-scrolling:touch!important;overscroll-behavior-y:none!important;background:#f4f7fb!important;}
                       body.ios-native-webview .topbar, body.ios-native-webview header.topbar{
                         position:fixed!important;top:0!important;left:0!important;right:0!important;width:100%!important;
                         z-index:2147483000!important;transform:translateZ(0)!important;-webkit-transform:translateZ(0)!important;
@@ -191,19 +192,30 @@ jobs:
                   webView.navigationDelegate = self
                   webView.uiDelegate = self
                   webView.allowsBackForwardNavigationGestures = true
-                  webView.scrollView.contentInsetAdjustmentBehavior = .automatic
+                  webView.isOpaque = false
+                  webView.backgroundColor = UIColor(red: 0.96, green: 0.97, blue: 0.99, alpha: 1.0)
+                  webView.scrollView.backgroundColor = webView.backgroundColor
+                  webView.scrollView.contentInsetAdjustmentBehavior = .never
+                  webView.scrollView.bounces = false
+                  webView.scrollView.alwaysBounceVertical = false
                   webView.scrollView.keyboardDismissMode = .interactive
                   view = webView
+                  view.backgroundColor = webView.backgroundColor
               }
 
               override func viewDidLoad() {
                   super.viewDidLoad()
                   setupProgressView()
                   setupRefreshControl()
-                  loadInitialPage()
+                  installLifecycleObservers()
+                  restoreCookiesThenLoad()
               }
 
-              deinit { webView.removeObserver(self, forKeyPath: #keyPath(WKWebView.estimatedProgress)) }
+              deinit {
+                  persistCookiesNow()
+                  NotificationCenter.default.removeObserver(self)
+                  webView.removeObserver(self, forKeyPath: #keyPath(WKWebView.estimatedProgress))
+              }
 
               private func setupProgressView() {
                   progressView.translatesAutoresizingMaskIntoConstraints = false
@@ -224,8 +236,46 @@ jobs:
 
               private var homeURL: URL { URL(string: defaultHomeURLString) ?? URL(string: "https://kuangjia2.wenanku.cc/")! }
 
+              private func installLifecycleObservers() {
+                  NotificationCenter.default.addObserver(self, selector: #selector(handleAppBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
+                  NotificationCenter.default.addObserver(self, selector: #selector(handleAppBackground), name: UIApplication.willTerminateNotification, object: nil)
+              }
+
+              @objc private func handleAppBackground() { persistCookiesNow() }
+
+              private func restoreCookiesThenLoad() {
+                  guard let data = UserDefaults.standard.data(forKey: cookieArchiveKey),
+                        let cookies = try? NSKeyedUnarchiver.unarchiveTopLevelObjectWithData(data) as? [HTTPCookie],
+                        !cookies.isEmpty else {
+                      loadInitialPage()
+                      return
+                  }
+                  let store = webView.configuration.websiteDataStore.httpCookieStore
+                  let group = DispatchGroup()
+                  for cookie in cookies where shouldStoreCookie(cookie) {
+                      group.enter()
+                      store.setCookie(cookie) { group.leave() }
+                  }
+                  group.notify(queue: .main) { [weak self] in self?.loadInitialPage() }
+              }
+
+              private func persistCookiesNow() {
+                  let store = webView.configuration.websiteDataStore.httpCookieStore
+                  store.getAllCookies { [weak self] cookies in
+                      guard let self = self else { return }
+                      let scoped = cookies.filter { self.shouldStoreCookie($0) }
+                      if let data = try? NSKeyedArchiver.archivedData(withRootObject: scoped, requiringSecureCoding: false) {
+                          UserDefaults.standard.set(data, forKey: self.cookieArchiveKey)
+                          UserDefaults.standard.synchronize()
+                      }
+                  }
+              }
+
               private func loadInitialPage() {
-                  if let saved = UserDefaults.standard.string(forKey: lastURLKey), let savedURL = URL(string: saved), shouldRestore(savedURL) {
+                  if let saved = UserDefaults.standard.string(forKey: lastURLKey),
+                     let savedURL = URL(string: saved),
+                     shouldRestore(savedURL),
+                     !isLoginURL(savedURL) {
                       load(url: savedURL)
                   } else {
                       load(url: homeURL)
@@ -234,9 +284,26 @@ jobs:
 
               private func load(url: URL) { webView.load(URLRequest(url: url)) }
 
+              private func normalizedHost(_ value: String?) -> String {
+                  return (value ?? "").trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+              }
+
               private func shouldRestore(_ url: URL) -> Bool {
                   guard let savedHost = url.host, let homeHost = homeURL.host else { return false }
-                  return savedHost == homeHost || savedHost.hasSuffix("." + homeHost)
+                  let a = normalizedHost(savedHost)
+                  let b = normalizedHost(homeHost)
+                  return a == b || a.hasSuffix("." + b) || b.hasSuffix("." + a)
+              }
+
+              private func shouldStoreCookie(_ cookie: HTTPCookie) -> Bool {
+                  let cookieDomain = normalizedHost(cookie.domain)
+                  guard !cookieDomain.isEmpty, let homeHost = homeURL.host else { return false }
+                  let h = normalizedHost(homeHost)
+                  return cookieDomain == h || h.hasSuffix("." + cookieDomain) || cookieDomain.hasSuffix("." + h)
+              }
+
+              private func isLoginURL(_ url: URL) -> Bool {
+                  return url.path.lowercased().contains("login.php")
               }
 
               @objc private func reloadPage() { webView.reload() }
@@ -250,9 +317,10 @@ jobs:
 
               func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
                   refreshControl.endRefreshing()
-                  if let url = webView.url, shouldRestore(url), url.scheme?.hasPrefix("http") == true {
+                  if let url = webView.url, shouldRestore(url), url.scheme?.hasPrefix("http") == true, !isLoginURL(url) {
                       UserDefaults.standard.set(url.absoluteString, forKey: lastURLKey)
                   }
+                  persistCookiesNow()
                   webView.evaluateJavaScript(Self.fixedTopbarScript, completionHandler: nil)
               }
 
