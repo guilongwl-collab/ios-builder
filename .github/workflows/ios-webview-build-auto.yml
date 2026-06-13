@@ -86,18 +86,74 @@ jobs:
 
       - name: Download source package
         run: |
-          set -e
-          rm -rf source build package.zip
+          set -Eeuo pipefail
+          rm -rf source build package.zip package.headers wget.headers
           mkdir -p source build
-          curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 "$PACKAGE_URL" -o package.zip
+
+          echo "Downloading source package..."
+          echo "Package URL host: $(python3 - <<'PY'
+          import os, urllib.parse
+          print(urllib.parse.urlparse(os.environ.get('PACKAGE_URL','')).netloc)
+          PY
+          )"
+
+          curl_exit=0
+          http_code="000"
+          set +e
+          http_code=$(curl -L --fail             --retry 5             --retry-delay 5             --retry-all-errors             --connect-timeout 30             --max-time 300             -A "Mozilla/5.0 (GitHub Actions iOS Builder)"             -D package.headers             -w "%{http_code}"             -o package.zip             "$PACKAGE_URL")
+          curl_exit=$?
+          set -e
+
+          echo "curl exit code: $curl_exit"
+          echo "curl HTTP code: $http_code"
+          if [ -f package.headers ]; then
+            echo "curl response headers:"
+            sed -n '1,40p' package.headers || true
+            echo "curl Content-Type: $(grep -i '^content-type:' package.headers | tail -1 | tr -d '' || true)"
+          fi
+
+          if [ "$curl_exit" -ne 0 ]; then
+            echo "curl download failed. Trying fallback downloader if available..."
+            rm -f package.zip
+            if command -v wget >/dev/null 2>&1; then
+              set +e
+              wget --tries=5 --waitretry=5 --timeout=30                 --user-agent="Mozilla/5.0 (GitHub Actions iOS Builder)"                 --server-response                 -O package.zip                 "$PACKAGE_URL" 2>wget.headers
+              wget_exit=$?
+              set -e
+              echo "wget exit code: $wget_exit"
+              if [ -f wget.headers ]; then
+                echo "wget response headers:"
+                sed -n '1,60p' wget.headers || true
+              fi
+              if [ "$wget_exit" -ne 0 ]; then
+                echo "Both curl and wget failed while downloading source package."
+                exit 56
+              fi
+            else
+              echo "wget is not available on this runner."
+              exit 56
+            fi
+          fi
+
+          if [ ! -s package.zip ]; then
+            echo "Downloaded package.zip is missing or empty."
+            ls -lah package.zip 2>/dev/null || true
+            exit 56
+          fi
+
+          echo "Downloaded package details:"
           ls -lah package.zip
           file package.zip || true
+          unzip -t package.zip
           python3 - <<'PY'
-          import sys, zipfile
-          if not zipfile.is_zipfile('package.zip'):
+          import os, sys, zipfile
+          path = 'package.zip'
+          size = os.path.getsize(path) if os.path.exists(path) else 0
+          print('Downloaded ZIP size bytes:', size)
+          if not zipfile.is_zipfile(path):
               print('Downloaded file is not a valid ZIP package')
               sys.exit(1)
-          with zipfile.ZipFile('package.zip') as z:
+          with zipfile.ZipFile(path) as z:
               bad = z.testzip()
               if bad:
                   print('ZIP test failed at', bad)
