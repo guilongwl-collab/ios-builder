@@ -109,7 +109,7 @@ jobs:
           if [ -f package.headers ]; then
             echo "curl response headers:"
             sed -n '1,40p' package.headers || true
-            echo "curl Content-Type: $(grep -i '^content-type:' package.headers | tail -1 | tr -d '' || true)"
+            echo "curl Content-Type: $(grep -i '^content-type:' package.headers | tail -1 | tr -d '\r' || true)"
           fi
 
           if [ "$curl_exit" -ne 0 ]; then
